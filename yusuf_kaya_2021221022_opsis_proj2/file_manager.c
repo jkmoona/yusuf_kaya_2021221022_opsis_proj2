@@ -2,257 +2,328 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <pthread.h>
 
-#define FIFO_NAME_PREFIX "named_pipe_" // Named pipes will be named as named_pipe_1, named_pipe_2, etc.
-#define NUM_WORKER_THREADS 5
+#define BUFFER_SIZE 100
+#define NUM_THREADS 2
+#define FILE_LIST_SIZE 10
+#define QUEUE_SIZE 20
 
-// Structure to store information about a file
-typedef struct file_info
+typedef struct
 {
-    char name[256];
+    char command[BUFFER_SIZE];
+    char file_name[BUFFER_SIZE];
+    char file_contents[BUFFER_SIZE];
+} request_t;
+
+// File information data structure
+typedef struct
+{
+    char file_name[BUFFER_SIZE];
+    char file_contents[BUFFER_SIZE];
+    int in_use;
+    int fd;
+    pthread_mutex_t mutex;
+} file_t;
+
+// File list data structure
+file_t File_List[FILE_LIST_SIZE];
+pthread_mutex_t file_list_mutex;
+
+// Request queue data structure
+typedef struct
+{
+    request_t requests[QUEUE_SIZE];
+    int front;
+    int rear;
     int size;
-} FileInfo;
+} request_queue_t;
+pthread_mutex_t queue_lock;
+pthread_cond_t queue_cond;
 
-// Structure to store a request
-typedef struct request
+// Initialize the request queue
+request_queue_t request_queue;
+
+void init_request_queue()
 {
-    char buffer[1024]; // Request data
-    struct request *next; // Pointer to next request in queue
-} Request;
+    request_queue.front = 0;
+    request_queue.rear = -1;
+    request_queue.size = 0;
+    pthread_mutex_init(&queue_lock, NULL);
+}
 
-// Global variables
-pthread_mutex_t queue_mutex; // Mutex to protect access to request queue
-pthread_cond_t queue_cond; // Condition variable to signal worker threads
-pthread_mutex_t file_list_mutex; // Mutex to protect access to File_List
-Request *request_queue; // Pointer to first request in queue
-FileInfo File_List[1024]; // List of files
-
-// Function prototypes
-void *worker_thread_func(void *arg);
-void create_file(char *name, int size);
-void delete_file(char *name);
-void read_file(char *name);
-void write_file(char *name, int size);
-void add_request(char *buffer);
-Request *get_request();
-
-int main()
+// Enqueue a request to the request queue
+void enqueue_request(request_t request)
 {
-    int i;
-    pthread_t worker_threads[NUM_WORKER_THREADS];
+    pthread_mutex_lock(&queue_lock);
 
-    // Initialize mutexes and condition variable
-    pthread_mutex_init(&queue_mutex, NULL);
-    pthread_cond_init(&queue_cond, NULL);
-    pthread_mutex_init(&file_list_mutex, NULL);
+    // Add the request to the queue
+    request_queue.rear = (request_queue.rear + 1) % QUEUE_SIZE;
+    request_queue.requests[request_queue.rear] = request;
+    request_queue.size++;
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_lock);
+}
 
-    // Initialize File_List
-    for (i = 0; i < 1024; i++)
-    {
-        File_List[i].name[0] = '\0';
-        File_List[i].size = 0;
+// Dequeue a request from the request queue
+request_t dequeue_request()
+{
+    pthread_mutex_lock(&queue_lock);
+
+    // Remove a request from the queue
+    request_t request = request_queue.requests[request_queue.front];
+    request_queue.front = (request_queue.front + 1) % QUEUE_SIZE;
+    request_queue.size--;
+
+    pthread_mutex_unlock(&queue_lock);
+
+    return request;
+}
+
+int queue_empty()
+{
+    return request_queue.rear == -1;
+}
+int queue_full() {
+    if (request_queue.front == (request_queue.rear + 1) % QUEUE_SIZE) {
+        return 1;
     }
+    return 0;
+}
 
-    // Create worker threads
-    for (i = 0; i < NUM_WORKER_THREADS; i++)
+void create_file(char *filename)
+{
+    // Check if file already exists in File_List
+    int i;
+    for (i = 0; i < 10; i++)
     {
-        if (pthread_create(&worker_threads[i], NULL, worker_thread_func, NULL) != 0)
+        if (strcmp(File_List[i].file_name, filename) == 0)
         {
-            perror("Error creating worker thread");
+            printf("Error: file already exists\n");
             exit(1);
         }
     }
 
+    // Find the first empty slot in File_List
+    for (i = 0; i < 10; i++)
+    {
+        if (File_List[i].file_name[0] == '\0')
+        {
+            strcpy(File_List[i].file_name, filename);
+            puts("Found a spot!");
+            break;
+        }
+    }
+
+    // Check if File_List is full
+    if (i == 10)
+    {
+        printf("Error: File_List is full\n");
+        return;
+    }
+
+    // Create the file on the system
+    FILE *fp = fopen(filename, "w");
+    if (fp == NULL)
+    {
+        printf("Error: failed to create file\n");
+        return;
+    }
+    fclose(fp);
+}
+
+void delete_file(char *filename)
+{
+    // Check if file exists in File_List
+    int i;
+    for (i = 0; i < 10; i++)
+    {
+        if (strcmp(File_List[i].file_name, filename) == 0)
+        {
+            break;
+        }
+    }
+
+    // Check if file does not exist in File_List
+    if (i == 10)
+    {
+        printf("Error: file does not exist\n");
+        return;
+    }
+
+    // Delete the file from the system
+    if (remove(filename) != 0)
+    {
+        printf("Error: failed to delete file\n");
+        return;
+    }
+
+    // Clear the file's entry in File_List
+    memset(File_List[i].file_name, 0, sizeof(File_List[i].file_name));
+    memset(File_List[i].file_contents, 0, sizeof(File_List[i].file_contents));
+}
+
+void read_file(char *filename)
+{
+    // Check if file exists in File_List
+    int i;
+    for (i = 0; i < 10; i++)
+    {
+        if (strcmp(File_List[i].file_name, filename) == 0)
+        {
+            break;
+        }
+    }
+
+    // Check if file does not exist in File_List
+    if (i == 10)
+    {
+        printf("Error: file does not exist\n");
+        return;
+    }
+
+    // Read from the file and store its contents in File_List
+    FILE *fp = fopen(filename, "r");
+    if (fp == NULL)
+    {
+        printf("Error: failed to read file\n");
+        return;
+    }
+    fgets(File_List[i].file_contents, BUFFER_SIZE, fp);
+    fclose(fp);
+}
+
+void write_file(request_t request)
+{
+    int i;
+    for (i = 0; i < FILE_LIST_SIZE; i++)
+    {
+        if (strcmp(File_List[i].file_name, request.file_name) == 0)
+        {
+            // Lock the file
+            pthread_mutex_lock(&File_List[i].mutex);
+
+            // Open the file in write mode
+            FILE *file = fopen(request.file_name, "w");
+            if (file == NULL)
+            {
+                printf("Error opening file!\n");
+                exit(1);
+            }
+
+            // Write to the file
+            fprintf(file, "%s", request.file_contents);
+
+            // Close the file
+            fclose(file);
+
+            // Update the contents in File_List
+            strcpy(File_List[i].file_contents, request.file_contents);
+
+            // Unlock the file
+            pthread_mutex_unlock(&File_List[i].mutex);
+            break;
+        }
+    }
+}
+
+// Worker thread function
+void *worker_thread_func(void *arg)
+{
+    request_t request;
     while (1)
     {
-        // Check for incoming requests
-        for (i = 1; i <= NUM_WORKER_THREADS; i++)
+        pthread_mutex_lock(&queue_lock);
+        while (queue_empty())
         {
-            // Open named pipe for reading
-            char fifo_name[256];
-            sprintf(fifo_name, "%s%d", FIFO_NAME_PREFIX, i); // Generate name for named pipe
-            mkfifo(fifo_name,0666);
-            int fd = open(fifo_name, O_RDONLY);
-            if (fd < 0)
-            {
-                continue;
-            }
-
-            // Read request from named pipe
-            char buffer[1024];
-            if (read(fd, buffer, 1024) > 0)
-            {
-                add_request(buffer); // Add request to queue
-            }
-
-            close(fd); // Close named pipe
+            // TODO 
+            // Workers are not getting in this code block
+            // exit(1);
+            pthread_cond_wait(&queue_cond, &queue_lock);
         }
+        request = dequeue_request();
+        // puts("Request dequeued!");
+        pthread_mutex_unlock(&queue_lock);
+
+        if (strcmp(request.command, "CREATE_FILE") == 0)
+        {
+            pthread_mutex_lock(&file_list_mutex);
+            create_file(request.file_name);
+            pthread_mutex_unlock(&file_list_mutex);
+        }
+        else if (strcmp(request.command, "DELETE_FILE") == 0)
+        {
+
+            pthread_mutex_lock(&file_list_mutex);
+            delete_file(request.file_name);
+            pthread_mutex_unlock(&file_list_mutex);
+        }
+        else if (strcmp(request.command, "READ_FILE") == 0)
+        {
+
+            pthread_mutex_lock(&file_list_mutex);
+            read_file(request.file_name);
+            pthread_mutex_unlock(&file_list_mutex);
+        }
+        else if (strcmp(request.command, "WRITE_FILE") == 0)
+        {
+
+            pthread_mutex_lock(&file_list_mutex);
+            write_file(request);
+            pthread_mutex_unlock(&file_list_mutex);
+        }
+    }
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    // Create thread pool for worker threads
+    pthread_t worker_threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_create(&worker_threads[i], NULL, worker_thread_func, NULL);
+    }
+
+    // Create named pipe
+    char *pipe_name = "/tmp/manager_pipe";
+    mkfifo(pipe_name, 0666);
+
+    // Open named pipe
+    int pipe_fd = open(pipe_name, O_RDONLY);
+    if (pipe_fd == -1)
+    {
+        perror("Error! Can't open pipe");
+        return 1;
+    }
+
+    request_t request;
+    while (1)
+    {
+        // Read a request from the pipe
+        read(pipe_fd, &request, sizeof(request_t));
+        printf("\nrequest = %s - %s\n", request.command, request.file_name);
+
+        // Enqueue the request
+        pthread_mutex_lock(&queue_lock);
+        enqueue_request(request);
+        puts("Request queued!");
+        pthread_cond_signal(&queue_cond);
+        pthread_mutex_unlock(&queue_lock);
+    }
+
+    // Close named pipe
+    close(pipe_fd);
+    unlink(pipe_name);
+
+    // Wait for worker threads to complete
+    for (int i = 0; i < NUM_THREADS; i++)
+    {
+        pthread_join(worker_threads[i], NULL);
     }
 
     return 0;
 }
-
-void *worker_thread_func(void *arg)
-{
-    while (1)
-    {
-        // Wait for request to be available
-        pthread_mutex_lock(&queue_mutex);
-        while (request_queue == NULL)
-        {
-            pthread_cond_wait(&queue_cond, &queue_mutex);
-        }
-        Request *request = get_request(); // Get request from queue
-        pthread_mutex_unlock(&queue_mutex);
-
-        // Parse command
-        char *command = strtok(request->buffer, " ");
-        char *name = strtok(NULL, " ");
-        int size = atoi(strtok(NULL, " "));
-
-        // Execute command
-        if (strcmp(command, "create") == 0)
-        {
-            create_file(name, size);
-        }
-        else if (strcmp(command, "delete") == 0)
-        {
-            delete_file(name);
-        }
-                else if (strcmp(command, "read") == 0)
-        {
-            read_file(name);
-        }
-        else if (strcmp(command, "write") == 0)
-        {
-            write_file(name, size);
-        }
-
-        free(request); // Free request memory
-    }
-
-    return NULL;
-}
-
-void create_file(char *name, int size)
-{
-   
-    // Lock mutex
-    pthread_mutex_lock(&file_list_mutex);
-
-    // Add file to list
-    int i;
-    for (i = 0; i < 1024; i++)
-    {
-        if (File_List[i].name[0] == '\0')
-        {
-            strcpy(File_List[i].name, name);
-            File_List[i].size = size;
-            break;
-        }
-    }
-
-    // Unlock mutex
-    pthread_mutex_unlock(&file_list_mutex);
-}
-
-void delete_file(char *name)
-{
-    // Lock mutex
-    pthread_mutex_lock(&file_list_mutex);
-
-    // Delete file from list
-    int i;
-    for (i = 0; i < 1024; i++)
-    {
-        if (strcmp(File_List[i].name, name) == 0)
-        {
-            File_List[i].name[0] = '\0';
-            File_List[i].size = 0;
-            break;
-        }
-    }
-
-    // Unlock mutex
-    pthread_mutex_unlock(&file_list_mutex);
-}
-
-void read_file(char *name)
-{
-        // Lock mutex
-    pthread_mutex_lock(&file_list_mutex);
-
-    // Read file from list
-    int i;
-    for (i = 0; i < 1024; i++)
-    {
-        if (strcmp(File_List[i].name, name) == 0)
-        {
-            printf("File %s has size %d\n", name, File_List[i].size);
-            break;
-        }
-    }
-
-    // Unlock mutex
-    pthread_mutex_unlock(&file_list_mutex);
-}
-
-void write_file(char *name, int size)
-{
-    // Lock mutex
-    pthread_mutex_lock(&file_list_mutex);
-
-    // Write to file in list
-    int i;
-    for (i = 0; i < 1024; i++)
-    {
-        if (strcmp(File_List[i].name, name) == 0)
-        {
-            File_List[i].size = size;
-            break;
-        }
-    }
-
-    // Unlock mutex
-    pthread_mutex_unlock(&file_list_mutex);
-}
-
-void add_request(char *buffer)
-{
-    // Allocate memory for request
-    Request *request = (Request *)malloc(sizeof(Request));
-    strcpy(request->buffer, buffer);
-    request->next = NULL;
-
-    // Add request to queue
-    pthread_mutex_lock(&queue_mutex);
-    if (request_queue == NULL)
-    {
-        request_queue = request;
-    }
-    else
-    {
-        Request *current = request_queue;
-        while (current->next != NULL)
-        {
-            current = current->next;
-        }
-        current->next = request;
-    }
-    pthread_cond_signal(&queue_cond); // Signal worker threads that a new request is available
-    pthread_mutex_unlock(&queue_mutex);
-}
-Request *get_request()
-{
-    Request *request = request_queue;
-    request_queue = request_queue->next;
-    return request;
-}
-
-
-
-
